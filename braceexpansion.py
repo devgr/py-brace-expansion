@@ -1,8 +1,9 @@
 # parser for `echo a{b,c}` expansion
 """
 expression = {[symbol], [grouping]}
-grouping = '{', expression, {',', expression}, '}'
-symbol = '([a-z][A-Z][0-9])+'
+grouping = '{', (expression, {',', expression}) | range, '}'
+range = symbol, '..', symbol
+symbol = '([a-z][A-Z][0-9]-)+'
 """
 import sys
 import re
@@ -14,6 +15,7 @@ class Tokens:
     StartGroup = 'StartGroup'
     EndGroup = 'EndGroup'
     ListDelimeter = 'ListDelimeter'
+    RangeDelimeter = 'RangeDelimeter'
 
 
 class Value:
@@ -27,12 +29,20 @@ class Value:
 
 def lex(text):
     stream = []
-    symbol_pattern = re.compile(r'[A-Za-z0-9]+')
+    symbol_pattern = re.compile(r'[A-Za-z0-9-]+')
+    range_pattern = re.compile(r'\.\.')
+
     while text:
         m = symbol_pattern.match(text)
         if m:
             stream.append(Value(m[0]))
             text = text[len(m[0]):]
+            continue
+
+        m = range_pattern.match(text)
+        if m:
+            stream.append(Tokens.RangeDelimeter)
+            text = text[2:]
             continue
         
         if text[0] == '{':
@@ -85,7 +95,7 @@ class Expression:
         inner_values = [item.eval() for item in self.items]
         assert len(inner_values) > 0
 
-        starter = list(inner_values[0])
+        starter = inner_values[0][:] # list copy
         results = self.looper(starter, inner_values[1:])
 
         return results
@@ -100,7 +110,7 @@ class Symbol:
         self.items = []
         self.value = value
     def eval(self):
-        return self.value
+        return [self.value]
     def __str__(self):
         return 'Symbol: ' + str(self.value)
     def __repr__(self):
@@ -139,6 +149,11 @@ class SemanticAnalyzer:
             return self.token_stream[0]
         return None
 
+    def double_peek(self):
+        if len(self.token_stream) > 1:
+            return self.token_stream[1]
+        return None
+
     def parse(self):
         self.ast = Root()
         self.expression(self.ast)
@@ -160,23 +175,84 @@ class SemanticAnalyzer:
             
             token = self.peek()
 
+    def expand_range(self, node, lower, upper):
+        def is_int(s):
+            try:
+                int(s) # works with negative numbers, but string.isdigit doesn't
+                return True
+            except ValueError:
+                return False
+
+        def add_symbol(node, value):
+            exp = Expression(node)
+            node.items.append(exp)
+            exp.items.append(Symbol(value))
+
+        if is_int(lower.value):
+            assert is_int(upper.value)
+            low_num = int(lower.value)
+            high_num = int(upper.value)
+            if low_num <= high_num:
+                curr = low_num
+                while curr <= high_num:
+                    add_symbol(node, str(curr))
+                    curr += 1
+            else:
+                curr = low_num
+                while curr >= high_num:
+                    add_symbol(node, str(curr))
+                    curr -= 1
+
+        else:
+            assert len(lower.value) == 1 and len(upper.value) == 1
+            # Do character range
+            low_val = ord(lower.value)
+            high_val = ord(upper.value)
+            if low_val <= high_val:
+                curr = low_val
+                while curr <= high_val:
+                    add_symbol(node, chr(curr))
+                    curr += 1
+            else:
+                curr = low_val
+                while curr >= high_val:
+                    add_symbol(node, chr(curr))
+                    curr -= 1
+
+
     def group(self, parent):
         node = Group(parent)
         parent.items.append(node)
 
-        self.expression(node)
-
         token = self.peek()
+        next_token = self.double_peek()
+        if type(token) is Value and next_token is Tokens.RangeDelimeter:
+            # expand the range
+            lower = self.get_token()
+            self.get_token() # eat the ..
+            upper = self.get_token() # error if it isn't a value
+            self.expand_range(node, lower, upper)
 
-        while token is Tokens.ListDelimeter:
-            self.get_token() # eat the ,
-            self.expression(node)
             token = self.peek()
 
-        if token is Tokens.EndGroup:
-            self.get_token() # eat the }
-            return
-        # else error
+            if token is Tokens.EndGroup:
+                self.get_token() # eat the }
+                return
+
+        else:
+            self.expression(node)
+
+            token = self.peek()
+
+            while token is Tokens.ListDelimeter:
+                self.get_token() # eat the ,
+                self.expression(node)
+                token = self.peek()
+
+            if token is Tokens.EndGroup:
+                self.get_token() # eat the }
+                return
+            # else error
 
     def pre_order_traversal(self, node, indent):
         tabs = ''.join(['\t' for i in range(indent)])
